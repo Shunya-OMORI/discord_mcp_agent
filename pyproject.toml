@@ -1,0 +1,27 @@
+[project]
+name = "agentproject"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = "~=3.12"
+dependencies = [
+#    "litellm",
+#    "google-adk",
+    "onnxruntime==1.21.0",
+    "selenium",
+    "beautifulsoup4",
+    "lxml",
+    "python-dotenv",
+    "browser-use",
+    "sympy",
+    "markitdown[all]",
+    "mcp[cli]",
+    "langchain-mcp-adapters==0.0.9",
+    "langchain",
+    "langgraph",
+    "langchain-openai",
+    "langchain-google-genai",
+    "langchain-xai",
+#    "mcp-use",
+    "fastembed",
+    "discord"
+]
