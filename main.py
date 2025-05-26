@@ -1,26 +1,39 @@
 import asyncio
-import shutil
 import os
 import json
-from datetime import datetime
 import sys
-import uuid
-import re
+from datetime import datetime
+import logging
+from typing import Dict, Any, List # List をインポート
 
+# .env ファイルから環境変数を読み込む
 from dotenv import load_dotenv, find_dotenv
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
+_ = load_dotenv(find_dotenv())
+
+# Langchain, MCP, Google Generative AI のインポート
+from langchain_core.messages import ToolMessage # SystemMessage, HumanMessage は llm_utils へ
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_mcp_adapters.client import MultiServerMCPClient, StdioConnection
 from langgraph.prebuilt import create_react_agent
 
+# プロジェクト固有の設定とユーティリティのインポート
 from config import (
-    BASE_WORKFLOW_LOGS_DIR, BASE_PROJECT_WORKSPACE_DIR,
-    MCP_CONNECTIONS, LLM_MODEL
+    MCP_CONNECTIONS, LLM_MODEL # BASE_DIR系は workflow_setup_utils へ
 )
-from workflow_log_utils import read_log, append_to_log
+from workflow_log_utils import read_log # append_to_log は workflow_setup_utils へ
+# 分割したモジュールをインポート
+from file_manifest_utils import load_file_manifest, save_file_manifest
+from automatic_processing_utils import run_automatic_file_processing
+from llm_utils import generate_llm_context_and_prompt
+from workflow_setup_utils import setup_new_workflow, setup_existing_workflow
 
-import logging
 
+# --- グローバル定数 ---
+FILE_MANIFEST_NAME = "file_manifest.json" # 各ユーティリティファイルでも参照するため、ここで一元管理も検討
+RESEARCH_NOTES_FILENAME = "research_notes.md"
+DISCORD_MESSAGE_LIMIT = 1800
+
+# ロギング設定 (メインスクリプト用)
 logger = logging.getLogger(__name__)
 if not logger.handlers:
     handler = logging.StreamHandler(sys.stdout)
@@ -29,398 +42,274 @@ if not logger.handlers:
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
 
-_ = load_dotenv(find_dotenv())
-
 async def run_workflow(
     initial_message: str,
     attachments: list[str] | None = None,
     existing_workflow_id: str | None = None,
     user_feedback_for_continuation: str | None = None
 ):
-    """
-    エージェントワークフロー全体を実行，または既存のものを継続します．
-    Discordボットがユーザーに応答するために必要な情報（返信テキスト，ファイルパスなど）を含む辞書を返します．
-    """
     workflow_id: str
     workflow_workspace_path: str
     workflow_log_file_path: str
-    current_step: int
+    file_manifest: Dict[str, Any]
+    original_initial_message_for_log: str
+    current_user_feedback: str | None = user_feedback_for_continuation
 
-    original_initial_message = initial_message
+    is_continuation = existing_workflow_id is not None
 
-    if existing_workflow_id:
-        # 既存ワークフローの継続処理
-        workflow_id = existing_workflow_id
-        workflow_workspace_path = os.path.join(BASE_PROJECT_WORKSPACE_DIR, f"workflow_{workflow_id}")
-        workflow_log_file_path = os.path.join(BASE_WORKFLOW_LOGS_DIR, f"workflow_{workflow_id}.md")
-
-        if not os.path.exists(workflow_workspace_path) or not os.path.exists(workflow_log_file_path):
-            err_msg = f"エラー: 既存ワークフローのデータ (ID: {workflow_id}) が見つかりません．"
-            logger.error(err_msg)
-            return {
-                "status": "error", "reply_text": err_msg, "output_files": [],
-                "workflow_id": workflow_id, "final_workspace_path": None, "log_file_path": None
-            }
-        logger.info(f"既存ワークフローを継続します: {workflow_id} (ワークスペース: {workflow_workspace_path})")
-
-        log_content_full = read_log(workflow_log_file_path)
-        original_match = re.search(r"初回ユーザーリクエスト: (.+)\n", log_content_full)
-        if original_match:
-            original_initial_message = original_match.group(1).strip()
-            logger.debug(f"ログから初回ユーザーリクエストを読み出し: '{original_initial_message}'")
+    try:
+        if is_continuation:
+            workflow_id, workflow_workspace_path, workflow_log_file_path, file_manifest, \
+            original_initial_message_for_log, current_user_feedback = setup_existing_workflow(
+                existing_workflow_id, initial_message, attachments, user_feedback_for_continuation
+            )
         else:
-            logger.warning(f"ログファイル '{workflow_log_file_path}' から初回ユーザーリクエストを抽出できませんでした．継続時の返信生成に影響する可能性があります．")
+            workflow_id, workflow_workspace_path, workflow_log_file_path, file_manifest, \
+            original_initial_message_for_log = setup_new_workflow(
+                initial_message, attachments
+            )
+    except FileNotFoundError as e_setup: # setup_existing_workflow からの例外
+        logger.error(e_setup)
+        return {"status": "error", "reply_text": str(e_setup), "output_files": [], "workflow_id": existing_workflow_id, "final_workspace_path": None, "log_file_path": None, "file_manifest_path": None}
 
-        if user_feedback_for_continuation:
-            append_to_log(workflow_log_file_path, f"## ワークフロー継続 (ユーザーより)\nユーザーフィードバック: {user_feedback_for_continuation}\n---")
-            current_step = 4 # フィードバック処理ステップから再開
-        else:
-            append_to_log(workflow_log_file_path, f"## ワークフロー継続 (ユーザーより)\n(フィードバックなし)\n---")
-            current_step = 2 # 作業実行ステップから再開
-            logger.warning(f"継続ワークフロー ({workflow_id}) にフィードバックが指定されていませんでした．ステップ2から再開します．")
 
-    else:
-        # 新規ワークフローの開始処理
-        workflow_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + str(uuid.uuid4())[:8]
-        workflow_workspace_path = os.path.join(BASE_PROJECT_WORKSPACE_DIR, f"workflow_{workflow_id}")
-        workflow_log_file_path = os.path.join(BASE_WORKFLOW_LOGS_DIR, f"workflow_{workflow_id}.md")
-        current_step = 1 # 目標設定ステップから開始
+    logger.info("ワークフロー開始前の初期自動ファイル処理を実行します...")
+    file_manifest, _ = await run_automatic_file_processing(
+        workflow_workspace_path, file_manifest
+    )
+    save_file_manifest(workflow_workspace_path, file_manifest)
+    logger.info("初期自動ファイル処理完了。")
 
-        os.makedirs(workflow_workspace_path, exist_ok=True)
-        log_dir = os.path.dirname(workflow_log_file_path)
-        os.makedirs(log_dir, exist_ok=True)
-
-        with open(workflow_log_file_path, "w", encoding="utf-8") as f:
-            f.write(f"# エージェントワークフローログ (ID: {workflow_id})\n\n")
-            f.write(f"ワークフロー・ワークスペース: `{workflow_workspace_path}`\n")
-            f.write(f"初回ユーザーリクエスト: {original_initial_message}\n---\n")
-        logger.info(f"新規ワークフロー '{workflow_id}' を開始しました．ログ: '{workflow_log_file_path}'")
-
-        if attachments:
-            append_to_log(workflow_log_file_path, "## 受信した添付ファイル:")
-            for temp_att_path in attachments:
-                if os.path.exists(temp_att_path):
-                    filename = os.path.basename(temp_att_path)
-                    dest_path = os.path.join(workflow_workspace_path, filename)
-                    try:
-                        shutil.copy(temp_att_path, dest_path)
-                        logger.info(f"添付ファイル '{filename}' を '{dest_path}' にコピーしました．")
-                        append_to_log(workflow_log_file_path, f"- ファイル '{filename}' をワークスペースにコピーしました．")
-                    except Exception as e_copy:
-                        logger.error(f"添付ファイル '{filename}' のワークスペースへのコピーに失敗: {e_copy}")
-                        append_to_log(workflow_log_file_path, f"- エラー: ファイル '{filename}' のコピー失敗 - {e_copy}")
-                else:
-                    logger.warning(f"添付ファイルのパス '{temp_att_path}' が見つかりません．")
-                    append_to_log(workflow_log_file_path, f"- 警告: 添付ファイルパス '{temp_att_path}' が見つかりません．")
-            append_to_log(workflow_log_file_path, "---")
-
-    # MCPサーバーへの接続準備
     logger.info("--- MCPサーバーへの接続準備中 ---")
     client_connections = {}
     for server_name, conn_config in MCP_CONNECTIONS.items():
         tool_script_path = conn_config["args"][0]
         tool_specific_args = conn_config["args"][1:]
-
         current_tool_args_for_mcp = [tool_script_path] + tool_specific_args
-
-        # ワークスペースとログパスを必要なツールに渡す
         if server_name == "filesystem":
             current_tool_args_for_mcp.append(workflow_workspace_path)
-            current_tool_args_for_mcp.append(workflow_log_file_path)
-        elif server_name == "logging":
-            current_tool_args_for_mcp.append(workflow_log_file_path)
-        elif server_name == "search":
-            current_tool_args_for_mcp.append(workflow_log_file_path)
-
+        
         if not os.path.exists(tool_script_path):
             logger.error(f"MCPツールスクリプトが見つかりません: {tool_script_path} (サーバー: {server_name})")
-            return {
-                "status": "error", "reply_text": f"設定エラー: ツールスクリプト {os.path.basename(tool_script_path)} が見つかりません．",
-                "output_files": [], "workflow_id": workflow_id,
-                "final_workspace_path": workflow_workspace_path, "log_file_path": workflow_log_file_path
-            }
+            return {"status": "error", "reply_text": f"設定エラー: ツールスクリプト {os.path.basename(tool_script_path)} が見つかりません．", "output_files": [], "workflow_id": workflow_id, "final_workspace_path": workflow_workspace_path, "log_file_path": workflow_log_file_path, "file_manifest_path": os.path.join(workflow_workspace_path, FILE_MANIFEST_NAME) if workflow_workspace_path else None }
 
         client_connections[server_name] = StdioConnection(
             command=conn_config["command"],
             args=current_tool_args_for_mcp
         )
-        logger.debug(f"StdioConnection 設定完了: {server_name} (実行: {conn_config['command']}, 引数: {current_tool_args_for_mcp})")
 
     async with MultiServerMCPClient(client_connections) as mcp_client_instance:
         logger.info("--- MCPクライアント接続完了，サーバー起動 ---")
-        logger.info(f"--- LLM初期化中: {LLM_MODEL} ---")
         try:
-            gemini = ChatGoogleGenerativeAI(model=LLM_MODEL)
+            gemini_llm = ChatGoogleGenerativeAI(model=LLM_MODEL)
         except Exception as e:
             logger.critical(f"LLMの初期化に失敗しました: {e}", exc_info=True)
-            return {
-                "status": "critical_error", "reply_text": "致命的なエラー: LLMを初期化できませんでした．",
-                "output_files": [], "workflow_id": workflow_id,
-                "final_workspace_path": workflow_workspace_path, "log_file_path": workflow_log_file_path
-            }
+            return {"status": "critical_error", "reply_text": "致命的なエラー: LLMを初期化できませんでした．", "output_files": [], "workflow_id": workflow_id, "final_workspace_path": workflow_workspace_path, "log_file_path": workflow_log_file_path, "file_manifest_path": os.path.join(workflow_workspace_path, FILE_MANIFEST_NAME) if workflow_workspace_path else None}
 
         logger.info(f"--- ワークフロー '{workflow_id}' 実行開始 ---")
-
-        max_iterations = 10
+        max_iterations = 15 # 1サイクルが LLM -> 自動処理 なので、実質的なLLM呼び出し回数はこの半分程度
         iteration_count = 0
+        
+        current_workflow_phase = "LLM_INITIAL_WORK"
+        if is_continuation and current_user_feedback: # user_feedback_for_continuation を current_user_feedback に変更
+            current_workflow_phase = "LLM_FEEDBACK_WORK" 
+        elif is_continuation: # フィードバックなしの継続
+            current_workflow_phase = "LLM_CHECK_AND_PROCEED"
 
-        is_continuation = existing_workflow_id is not None
+        # SyntaxError修正のため、whileループをtryブロックで囲む
+        try:
+            while iteration_count < max_iterations:
+                iteration_count += 1
+                logger.info(f"\n--- ワークフロー '{workflow_id}' - イテレーション: {iteration_count}, フェーズ: {current_workflow_phase} ---")
+                
+                log_content_for_llm = read_log(workflow_log_file_path) 
+                file_manifest = load_file_manifest(workflow_workspace_path) 
+                
+                llm_messages, human_message_content_for_log = generate_llm_context_and_prompt(
+                    log_content_for_llm,
+                    file_manifest,
+                    workflow_workspace_path,
+                    original_initial_message_for_log,
+                    current_workflow_phase,
+                    initial_message_for_phase=initial_message if current_workflow_phase == "LLM_INITIAL_WORK" else "",
+                    user_feedback=current_user_feedback if current_workflow_phase == "LLM_FEEDBACK_WORK" else ""
+                )
+                logger.debug(f"LLMへのHumanMessage (先頭500文字):\n{human_message_content_for_log[:500]}")
 
-        while iteration_count < max_iterations:
-            iteration_count += 1
-            logger.info(f"\n--- ワークフロー '{workflow_id}' - ステップ: {current_step} (繰り返し: {iteration_count}) ---")
-            log_content = read_log(workflow_log_file_path)
 
-            available_tools = mcp_client_instance.get_tools()
-            tool_names = [t.name for t in available_tools]
-            logger.debug(f"LLMが利用可能なツール: {tool_names}")
+                available_tools_full = mcp_client_instance.get_tools()
+                tools_for_llm = available_tools_full
+                
+                if current_workflow_phase in ["LLM_INITIAL_WORK", "LLM_FEEDBACK_WORK"]:
+                    tools_for_llm = [tool for tool in available_tools_full if tool.name != "make_reply"]
+                    if not tools_for_llm: tools_for_llm = available_tools_full # 念のため
+                    
+                    current_llm_agent = create_react_agent(gemini_llm, tools_for_llm)
+                    response = await current_llm_agent.ainvoke({"messages": llm_messages})
+                    current_workflow_phase = "AUTOMATIC_FILE_PROCESSING"
 
-            if current_step == 3 and not any(tool.name == 'make_reply' for tool in available_tools):
-                logger.warning("警告: ステップ3では 'make_reply' ツールが必要ですが，利用可能なツールリストに見つかりません！")
-
-            llm = create_react_agent(gemini, available_tools)
-            llm_input_messages = []
-
-            truncated_log_context = log_content[-3000:]
-            context_message = (
-                f"現在の状況を把握するためのログの抜粋です:\n```markdown\n{truncated_log_context}\n```\n"
-                f"現在のワークフローの作業ディレクトリは '{workflow_workspace_path}' です．ファイル操作はこのディレクトリ内で相対パスを使用して行ってください．\n"
-            )
-
-            # プロンプト生成の条件分岐
-            if current_step == 1: # 目標設定ステップ (新規のみ)
-                llm_input_messages.append(HumanMessage(
-                    content=f"{context_message}\nユーザーからの最初の要求は以下の通りです:\n---\n{original_initial_message}\n---\n"
-                            f"この要求に基づいて，最終的な達成目標を定義し，`add_goal` ツールを使ってログに '## GOAL: ' の形式で追記してください．目標は明確かつ実現可能なものにしてください．目標設定後は停止してください．"
-                ))
-
-            elif current_step == 2: # 作業実行ステップ
-                llm_input_messages.append(HumanMessage(
-                    content=f"{context_message}\nログに記載されている最新の GOAL に基づいて，利用可能なツールを使用して作業を進めてください．\n"
-                            f"現在の作業ディレクトリは '{workflow_workspace_path}' です．ファイル操作はこのディレクトリ内で行ってください．\n"
-                            f"最終目標を達成した場合は `workflow_complete` ツールを使用し，成果物（例: ファイルパス）について言及して完了を通知してください．まだ達成できていない場合は，作業を一つ進めて停止してください．"
-                ))
-
-            elif current_step == 3: # 返信生成ステップ
-                feedback_ref_in_prompt = ""
-                if is_continuation and user_feedback_for_continuation:
-                    feedback_ref_in_prompt = f"特に，ユーザーからの最新のフィードバック「{user_feedback_for_continuation}」を考慮し，"
-                    reply_instruction = (
-                        f"このワークフローはユーザーからのフィードバックを受けて継続され，完了しました．ユーザーの最初の要求 ('{original_initial_message}') と，"
-                        f"{feedback_ref_in_prompt}"
-                        f"**フィードバックを受けて，ワークフローが最終的に何を達成したか，またはどのように課題に対応したか**を報告してください．\n"
+                elif current_workflow_phase == "AUTOMATIC_FILE_PROCESSING":
+                    file_manifest, manifest_updated = await run_automatic_file_processing(
+                        workflow_workspace_path, file_manifest
                     )
-                elif is_continuation:
-                    reply_instruction = (
-                        f"このワークフローは継続実行されました．ユーザーの最初の要求 ('{original_initial_message}') に対して，"
-                        f"**ワークフローが何を達成したか**を報告してください．継続前の状況（ログを確認）も考慮に入れてください．\n"
-                    )
-                else:
-                    reply_instruction = (
-                        f"ワークフローが完了しました．ユーザーの最初の要求 ('{original_initial_message}') に対して，"
-                        f"**ワークフローが何を達成したか**を報告してください．\n"
-                    )
+                    save_file_manifest(workflow_workspace_path, file_manifest)
+                    current_workflow_phase = "LLM_CHECK_AND_PROCEED"
+                    # このフェーズではLLM呼び出しはないので、ループの先頭に戻る
+                    if iteration_count >= max_iterations: # 自動処理後に最大反復に達した場合
+                        logger.warning(f"自動処理後、最大反復回数 ({max_iterations}) に到達。")
+                        # この場合、次のLLM_CHECK_AND_PROCEEDは実行されないので、ここで終了処理。
+                        # ただし、通常はLLMの応答後に最大反復チェックが入る。
+                        # ここでは、ループ条件で判定されるので、特別な処理は不要。
+                    continue 
 
-                llm_input_messages.append(HumanMessage(
-                    content=f"{context_message}\nワークフローが完了しました．ユーザーへの最終返信を生成する必要があります．\n"
-                            f"{reply_instruction}"
-                            f"これまでのログ全体と，'{workflow_workspace_path}' 内に作成された成果物を総合的に考慮し，返信内容を生成してください．\n"
-                            f"`make_reply` ツールを使用し，`reply_text` にユーザーへのメッセージ，`output_files` に成果物のファイルパス（ワークスペースからの相対パスのリスト）を指定して，返信内容を生成してください．返信生成後は停止してください．"
-                ))
+                elif current_workflow_phase == "LLM_CHECK_AND_PROCEED":
+                    current_llm_agent = create_react_agent(gemini_llm, available_tools_full) # 全ツール利用可能
+                    response = await current_llm_agent.ainvoke({"messages": llm_messages})
+                    # 次のデフォルトフェーズは自動処理。make_replyが呼ばれればループを抜ける。
+                    current_workflow_phase = "AUTOMATIC_FILE_PROCESSING" 
+                else: 
+                    logger.error(f"未定義のワークフローフェーズ: {current_workflow_phase}")
+                    # このエラーはループ内で発生するので、ループを抜けてエラーリターン
+                    raise ValueError(f"内部エラー: 未定義のワークフローフェーズ {current_workflow_phase}")
 
-            elif current_step == 4: # フィードバック処理ステップ
-                feedback_message_for_llm = ""
-                if user_feedback_for_continuation:
-                    feedback_message_for_llm = f"ユーザーから以下の最新フィードバック/追加の指示がありました:\n---\n{user_feedback_for_continuation}\n---\n"
 
-                llm_input_messages.append(HumanMessage(
-                    content=f"{context_message}\n"
-                            f"{feedback_message_for_llm}"
-                            f"このワークフローはユーザーからのフィードバックを受けて継続されています．ユーザーの最初の要求 ('{original_initial_message}') と，これまでのログ（特に設定済みのGOALや計画），および上記の最新のフィードバックをよく確認してください．\n"
-                            f"**フィードバックに基づいて最終目標を再定義し，`add_goal` ツールを使用してログに新しいGOALを追記してください．目標再設定後は停止してください．\n"
-                ))
+                detected_signals = []
+                final_reply_text_from_tool = "" 
+                final_output_files_from_tool: List[str] = [] 
+                
+                if response and response.get("messages"):
+                    for resp_msg in response["messages"]:
+                        if isinstance(resp_msg, ToolMessage):
+                            tool_output_content = str(resp_msg.content)
+                            tool_name_called = resp_msg.name
+                            logger.info(f"--- ツール実行: {tool_name_called}, 出力(先頭100文字): {tool_output_content[:100]} ---")
 
-            logger.debug(f"LLMへの入力メッセージ (ステップ{current_step}): {llm_input_messages[0].content[:500]}...")
-
-            response = await llm.ainvoke({"messages": llm_input_messages})
-
-            detected_signals = []
-            final_reply_text_from_tool = None
-            final_output_files_from_tool = []
-
-            logger.info("--- LLM応答メッセージの処理中 ---")
-            for msg_idx, resp_msg in enumerate(response["messages"]):
-                log_entry = f"## LLM/ツールメッセージ {msg_idx+1}:\nタイプ: {type(resp_msg).__name__}\n"
-                if hasattr(resp_msg, 'name') and resp_msg.name: log_entry += f"名前/ツール名: {resp_msg.name}\n"
-                if hasattr(resp_msg, 'tool_call_id') and resp_msg.tool_call_id: log_entry += f"ツール呼び出しID: {resp_msg.tool_call_id}\n"
-
-                content_to_log = ""
-                if hasattr(resp_msg, 'content'):
-                    content_to_log = str(resp_msg.content)
-                    if isinstance(resp_msg, AIMessage) and len(content_to_log) > 1000:
-                        content_to_log = content_to_log[:1000] + "... (省略)"
-                    if isinstance(resp_msg, ToolMessage) and len(content_to_log) > 1000:
-                        content_to_log = content_to_log[:1000] + "... (省略)"
-
-                log_entry += f"内容: {content_to_log}\n"
-                append_to_log(workflow_log_file_path, log_entry + "---")
-                logger.debug(f"ログ記録メッセージ: {log_entry.splitlines()[0]}...")
-
-                if isinstance(resp_msg, ToolMessage):
-                    tool_output_content = str(resp_msg.content)
-                    tool_name_called = resp_msg.name
-                    logger.info(f"--- ツール実行: {tool_name_called}, 出力(先頭100文字): {tool_output_content[:100]} ---")
-
-                    if tool_name_called == "add_goal" and tool_output_content == "__GOAL_SET__":
-                        detected_signals.append("__GOAL_SET__")
-                    elif tool_name_called == "workflow_complete" and tool_output_content == "__WORKFLOW_COMPLETE__":
-                        detected_signals.append("__WORKFLOW_COMPLETE__")
-                    elif tool_name_called == "make_reply":
-                        detected_signals.append("__REPLY_GENERATED__")
-                        try:
-                            payload = json.loads(tool_output_content)
-                            final_reply_text_from_tool = payload.get("reply_text", "エラー: ツールから返信テキストが欠落しています．")
-                            final_output_files_from_tool = payload.get("output_files", [])
-                            logger.info(f"make_reply ツール成功: テキスト='{final_reply_text_from_tool[:50]}...', ファイル数={len(final_output_files_from_tool)}")
-                        except json.JSONDecodeError as e:
-                            logger.error(f"make_replyからのJSONパース失敗: {e}．内容: {tool_output_content}")
-                            final_reply_text_from_tool = f"エラー: エージェントからの返信内容を処理できませんでした (JSONエラー: {e})．"
-                        except Exception as e_payload:
-                            logger.error(f"make_replyのペイロード処理中エラー: {e_payload}．内容: {tool_output_content}")
-                            final_reply_text_from_tool = f"エラー: エージェントからの返信内容を解釈できませんでした (処理エラー: {e_payload})．"
-
-            logger.info(f"--- 検出されたシグナル: {detected_signals} ---")
-            state_transitioned_this_iteration = False
-
-            # 状態遷移ロジック
-            if current_step == 1: # 目標設定ステップ
-                if "__GOAL_SET__" in detected_signals:
-                    current_step = 2
-                    append_to_log(workflow_log_file_path, "システム: 目標設定完了．作業実行ステップに移行します．\n---")
-                    logger.info("--- ステップ2へ移行: 作業実行 ---")
-                    state_transitioned_this_iteration = True
-                else:
-                    logger.warning(f"ステップ1: __GOAL_SET__ シグナルが検出されませんでした．LLMへの指示が不明確か，ツールが失敗した可能性があります．")
-                    append_to_log(workflow_log_file_path, "システム警告: 目標が設定されませんでした．LLMの思考を確認してください．\n---")
-
-            elif current_step == 2: # 作業実行ステップ
-                if "__WORKFLOW_COMPLETE__" in detected_signals:
-                    current_step = 3 # 返信生成ステップへ移行
-                    append_to_log(workflow_log_file_path, "システム: ワークフロー完了シグナル受信．返信生成ステップに移行します．\n---")
-                    logger.info("--- ステップ3へ移行: 返信生成 ---")
-                    state_transitioned_this_iteration = True
-                else:
-                    logger.info(f"ステップ2: 完了シグナルなし．必要であれば次の繰り返しで作業を継続します．")
-                    append_to_log(workflow_log_file_path, "システム: ステップ2の作業を継続します．\n---")
-
-            elif current_step == 3: # 返信生成ステップ
+                            if tool_name_called == "make_reply":
+                                detected_signals.append("__REPLY_GENERATED__")
+                                try:
+                                    payload = json.loads(tool_output_content)
+                                    final_reply_text_from_tool = payload.get("reply_text", "エラー: ツールから返信テキストが欠落しています．")
+                                    output_files_relative = payload.get("output_files", [])
+                                    if not isinstance(output_files_relative, list):
+                                        logger.warning(f"make_reply の output_files がリストではありません: {output_files_relative}")
+                                        output_files_relative = [str(output_files_relative)] if output_files_relative else []
+                                    final_output_files_from_tool = [os.path.join(workflow_workspace_path, f.lstrip('./\\')) for f in output_files_relative if f]
+                                except json.JSONDecodeError as e:
+                                    logger.error(f"make_replyからのJSONパース失敗: {e}．内容: {tool_output_content}")
+                                    final_reply_text_from_tool = f"エラー: エージェントからの返信内容を処理できませんでした (JSONエラー)。"
+                
                 if "__REPLY_GENERATED__" in detected_signals:
-                    logger.info("--- 返信生成完了．ワークフローを終了し，Discordボットに応答を返します． ---")
-                    append_to_log(workflow_log_file_path, f"システム: 返信生成完了．ワークフロー終了．\n最終返信テキスト(先頭100文字): {final_reply_text_from_tool[:100]}...\n出力ファイル: {final_output_files_from_tool}\n---")
+                    logger.info("--- 返信生成完了。ワークフローを終了します。 ---")
+                    
+                    processed_reply_text = final_reply_text_from_tool
+                    
+                    research_notes_abs_path = os.path.join(workflow_workspace_path, RESEARCH_NOTES_FILENAME)
+                    if os.path.exists(research_notes_abs_path) and research_notes_abs_path not in final_output_files_from_tool:
+                        logger.info(f"調査ノート {RESEARCH_NOTES_FILENAME} を成果物リストに追加します。")
+                        final_output_files_from_tool.append(research_notes_abs_path)
+
+                    for output_file_path in final_output_files_from_tool:
+                        if os.path.isfile(output_file_path) and \
+                           (output_file_path.lower().endswith(".txt") or output_file_path.lower().endswith(".md")):
+                            try:
+                                with open(output_file_path, "r", encoding="utf-8") as f_content:
+                                    content = f_content.read()
+                                if len(processed_reply_text) + len(content) + 100 < DISCORD_MESSAGE_LIMIT: 
+                                    processed_reply_text += f"\n\n--- 添付ファイル `{os.path.basename(output_file_path)}` の内容 ---\n{content}"
+                                    logger.info(f"ファイル '{os.path.basename(output_file_path)}' の内容を返信テキストに含めました。")
+                                    break 
+                            except Exception as e_read_final:
+                                logger.warning(f"最終返信のためのファイル読み込みエラー ({output_file_path}): {e_read_final}")
+                    
+                    save_file_manifest(workflow_workspace_path, file_manifest)
                     return {
-                        "status": "success",
-                        "reply_text": final_reply_text_from_tool,
-                        "output_files": final_output_files_from_tool,
-                        "workflow_id": workflow_id,
-                        "final_workspace_path": workflow_workspace_path,
-                        "log_file_path": workflow_log_file_path
+                        "status": "success", "reply_text": processed_reply_text,
+                        "output_files": final_output_files_from_tool, "workflow_id": workflow_id,
+                        "final_workspace_path": workflow_workspace_path, "log_file_path": workflow_log_file_path,
+                        "file_manifest_path": os.path.join(workflow_workspace_path, FILE_MANIFEST_NAME)
                     }
-                else:
-                    logger.warning(f"ステップ3: __REPLY_GENERATED__ シグナルが検出されませんでした．make_replyツールが正しく呼び出されなかった可能性があります．")
-                    append_to_log(workflow_log_file_path, "システム警告: 返信が生成されませんでした．LLMの思考（make_reply呼び出し）を確認してください．\n---")
+            
+            # while ループの最後 (最大反復回数到達時)
+            logger.warning(f"ワークフロー '{workflow_id}' が最大繰り返し回数 ({max_iterations}) に達しました．")
+            save_file_manifest(workflow_workspace_path, file_manifest)
+            return {
+                "status": "max_iterations_reached",
+                "reply_text": "ワークフローが最大繰り返し回数に達しました．詳細はファイルマニフェストを確認してください．",
+                "output_files": [], "workflow_id": workflow_id,
+                "final_workspace_path": workflow_workspace_path, "log_file_path": workflow_log_file_path,
+                "file_manifest_path": os.path.join(workflow_workspace_path, FILE_MANIFEST_NAME)
+            }
 
-            elif current_step == 4: # フィードバック処理ステップ
-                if "__GOAL_SET__" in detected_signals:
-                    current_step = 2 # フィードバック処理完了，作業実行へ
-                    append_to_log(workflow_log_file_path, "システム: 目標再設定完了．作業実行ステップに移行します．\n---")
-                    logger.info("--- ステップ2へ移行: 作業実行 ---")
-                    state_transitioned_this_iteration = True
-                else:
-                    logger.info(f"ステップ4: __WORKFLOW_COMPLETE__ シグナルなし．フィードバック処理/計画見直しを継続します．")
-                    append_to_log(workflow_log_file_path, "システム: ステップ4のフィードバック処理を継続します．\n---")
+        except Exception as e_main_loop: # ここが SyntaxError のあった箇所に対応
+            logger.critical(f"ワークフロー '{workflow_id}' のメインループで予期せぬエラー: {e_main_loop}", exc_info=True)
+            if workflow_workspace_path and os.path.exists(workflow_workspace_path) and file_manifest: # file_manifestが定義されているか確認
+                save_file_manifest(workflow_workspace_path, file_manifest)
+            return {
+                "status": "error", "reply_text": f"ワークフロー実行中に致命的なエラーが発生しました: {e_main_loop}", 
+                "output_files": [], "workflow_id": workflow_id, 
+                "final_workspace_path": workflow_workspace_path, 
+                "log_file_path": workflow_log_file_path,
+                "file_manifest_path": os.path.join(workflow_workspace_path, FILE_MANIFEST_NAME) if workflow_workspace_path else None
+            }
 
-            # 状態遷移がなかった場合のフォールバック処理
-            if not state_transitioned_this_iteration:
-                # ステップ1, 3, 4で停滞している場合は警告/エラー (ステップ2は複数回ループが正常)
-                if current_step in [1, 3, 4]:
-                    logger.warning(f"ワークフローがステップ {current_step} で状態遷移せずに停滞している可能性があります．(繰り返し: {iteration_count})")
-                    if iteration_count >= 3:
-                        logger.error(f"ワークフローがステップ {current_step} で3回以上停滞したため，異常終了します．")
-                        append_to_log(workflow_log_file_path, f"## エラー: ワークフロー異常終了 (ステップ {current_step} で停滞)\n---")
-                        return {
-                            "status": "error", "reply_text": f"ワークフロー実行エラー: ステップ {current_step} で処理が停滞しました．",
-                            "output_files": [], "workflow_id": workflow_id,
-                            "final_workspace_path": workflow_workspace_path, "log_file_path": workflow_log_file_path
-                        }
-                else: # ステップ2での停滞
-                    logger.debug(f"ワークフローがステップ {current_step} で状態遷移しませんでした．作業継続を試みます．(繰り返し: {iteration_count})")
-
-        logger.warning(f"ワークフロー '{workflow_id}' が最大繰り返し回数 ({max_iterations}) に達しました．処理を終了します．")
-        append_to_log(workflow_log_file_path, f"## システム: 最大繰り返し回数到達．ワークフロー終了．\n---")
-        return {
-            "status": "max_iterations_reached",
-            "reply_text": "ワークフローが最大繰り返し回数に達しました．詳細はログを確認してください．",
-            "output_files": [],
-            "workflow_id": workflow_id,
-            "final_workspace_path": workflow_workspace_path,
-            "log_file_path": workflow_log_file_path
-        }
-
-    # この部分には通常到達しないはず
-    logger.error(f"ワークフロー '{workflow_id}' がメインループ外で予期せず終了しました．")
-    return {
-        "status": "error", "reply_text": "ワークフローが予期せず終了しました．", "output_files": [],
-        "workflow_id": workflow_id, "final_workspace_path": workflow_workspace_path, "log_file_path": workflow_log_file_path
-    }
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', stream=sys.stdout)
-
     logger.info("main.py をテスト目的で直接実行します．")
 
+    # config は main.py と同じ階層にある想定
     from config import ensure_directories, check_tool_scripts
     ensure_directories()
     if not check_tool_scripts():
         logger.critical("一部のMCPツールスクリプトが見つからないため，テストを中止します．")
         sys.exit(1)
 
-    current_workflow_id = None
+    current_workflow_id_for_test = None
     while True:
-        if current_workflow_id:
-            user_query = input(f"ワークフロー {current_workflow_id} に追加で指示/フィードバックを入力してください ('終了'で終了, '新規'で新規開始):\n> ")
-            if user_query.lower() == '終了':
-                break
-            elif user_query.lower() == '新規':
-                current_workflow_id = None
-                user_query = input("新しいタスクを入力してください:\n> ")
-                if not user_query or user_query.lower() == '終了':
-                    break
-                result = asyncio.run(run_workflow(initial_message=user_query, attachments=[])) # 新規開始
-            else:
-                result = asyncio.run(run_workflow(
-                    initial_message="継続時のダミーメッセージ", # initial_message は継続時には使われないが引数として必要
-                    existing_workflow_id=current_workflow_id,
-                    user_feedback_for_continuation=user_query
-                ))
-        else:
-            user_query = input("実行したいタスクを入力してください（'終了'で終了）:\n> ")
-            if user_query.lower() == '終了':
-                break
-            if not user_query:
+        attachments_for_test: List[str] = [] # 型ヒント追加
+        # (テスト用一時ファイル作成のコードは省略)
+
+        if current_workflow_id_for_test:
+            user_query_for_test = input(f"ワークフロー {current_workflow_id_for_test} に追加で指示/フィードバックを入力 ('終了'で終了, '新規'で新規開始):\n> ")
+            if user_query_for_test.lower() == '終了': break
+            if user_query_for_test.lower() == '新規':
+                current_workflow_id_for_test = None
                 continue
-            result = asyncio.run(run_workflow(initial_message=user_query, attachments=[])) # 新規開始
+            
+            result_for_test = asyncio.run(run_workflow(
+                initial_message="継続時のダミーメッセージ",
+                attachments=attachments_for_test,
+                existing_workflow_id=current_workflow_id_for_test,
+                user_feedback_for_continuation=user_query_for_test
+            ))
+        else:
+            user_query_for_test = input("実行したいタスクを入力してください（'終了'で終了）:\n> ")
+            if user_query_for_test.lower() == '終了': break
+            if not user_query_for_test: continue
+            
+            result_for_test = asyncio.run(run_workflow(
+                initial_message=user_query_for_test,
+                attachments=attachments_for_test
+            ))
 
         logger.info(f"\n--- ワークフローテスト結果 ---")
-        logger.info(f"ステータス: {result.get('status')}")
-        logger.info(f"返信テキスト: {result.get('reply_text')}")
-        logger.info(f"出力ファイル: {result.get('output_files')}")
-        logger.info(f"ワークフローID: {result.get('workflow_id')}")
-        logger.info(f"ワークスペースパス: {result.get('final_workspace_path')}")
-        logger.info(f"ログファイルパス: {result.get('log_file_path')}")
+        logger.info(f"ステータス: {result_for_test.get('status')}")
+        logger.info(f"返信テキスト:\n{result_for_test.get('reply_text')}")
+        logger.info(f"出力ファイル: {result_for_test.get('output_files')}")
+        logger.info(f"ワークフローID: {result_for_test.get('workflow_id')}")
+        logger.info(f"ワークスペースパス: {result_for_test.get('final_workspace_path')}")
+        logger.info(f"ログファイルパス: {result_for_test.get('log_file_path')}")
+        logger.info(f"ファイルマニフェストパス: {result_for_test.get('file_manifest_path')}")
 
-        if result.get('status') in ["success", "max_iterations_reached"]:
-            current_workflow_id = result.get('workflow_id')
+        if result_for_test.get('status') in ["success", "max_iterations_reached"] and result_for_test.get('workflow_id'):
+            prompt_continue = input("このワークフローを継続しますか？ (y/N): ")
+            if prompt_continue.lower() == 'y':
+                current_workflow_id_for_test = result_for_test.get('workflow_id')
+            else:
+                current_workflow_id_for_test = None
         else:
-            current_workflow_id = None
-
+            current_workflow_id_for_test = None
+            if result_for_test.get('status') == 'error' or result_for_test.get('status') == 'critical_error':
+                 logger.error("ワークフローがエラーで終了したため、継続できません。")
+        
     logger.info("テスト実行を終了します．")

@@ -1,0 +1,26 @@
+{
+    "files": {
+        "gaussian_plot.py": {
+            "type": "python",
+            "hash": "b498ee0b93bac09901a6343fe14416916c2ecaeee427e97aaff2fa5b7179f559",
+            "content_logged_timestamp": "2025-05-26T17:01:59.906964",
+            "execution_result": {
+                "stdout": "",
+                "stderr": "C:\\Users\\syuny\\MCP_Concierge\\nagamy\\AgentProject\\project_workspace\\workflow_20250526_170145_c5240b82\\gaussian_plot.py:34: UserWarning: Glyph 22793 (\\N{CJK UNIFIED IDEOGRAPH-5909}) missing from font(s) DejaVu Sans.\n  plt.savefig(\"gaussian_3d.png\")\nC:\\Users\\syuny\\MCP_Concierge\\nagamy\\AgentProject\\project_workspace\\workflow_20250526_170145_c5240b82\\gaussian_plot.py:34: UserWarning: Glyph 25968 (\\N{CJK UNIFIED IDEOGRAPH-6570}) missing from font(s) DejaVu Sans.\n  plt.savefig(\"gaussian_3d.png\")\nC:\\Users\\syuny\\MCP_Concierge\\nagamy\\AgentProject\\project_workspace\\workflow_20250526_170145_c5240b82\\gaussian_plot.py:34: UserWarning: Glyph 12460 (\\N{KATAKANA LETTER GA}) missing from font(s) DejaVu Sans.\n  plt.savefig(\"gaussian_3d.png\")\nC:\\Users\\syuny\\MCP_Concierge\\nagamy\\AgentProject\\project_workspace\\workflow_20250526_170145_c5240b82\\gaussian_plot.py:34: UserWarning: Glyph 12454 (\\N{KATAKANA LETTER U}) missing from font(s) DejaVu Sans.\n  plt.savefig(\"gaussian_3d.png\")\nC:\\Users\\syuny\\MCP_Concierge\\nagamy\\AgentProject\\project_workspace\\workflow_20250526_170145_c5240b82\\gaussian_plot.py:34: UserWarning: Glyph 12473 (\\N{KATAKANA LETTER SU}) missing from font(s) DejaVu Sans.\n  plt.savefig(\"gaussian_3d.png\")\nC:\\Users\\syuny\\MCP_Concierge\\nagamy\\AgentProject\\project_workspace\\workflow_20250526_170145_c5240b82\\gaussian_plot.py:34: UserWarning: Glyph 20998 (\\N{CJK UNIFIED IDEOGRAPH-5206}) missing from font(s) DejaVu Sans.\n  plt.savefig(\"gaussian_3d.png\")\nC:\\Users\\syuny\\MCP_Concierge\\nagamy\\AgentProject\\project_workspace\\workflow_20250526_170145_c5240b82\\gaussian_plot.py:34: UserWarning: Glyph 24067 (\\N{CJK UNIFIED IDEOGRAPH-5E03}) missing from font(s) DejaVu Sans.\n  plt.savefig(\"gaussian_3d.png\")\n",
+                "return_code": 0,
+                "timestamp": "2025-05-26T17:01:59.906970"
+            },
+            "status": "executed_ok",
+            "last_processed_timestamp": "2025-05-26T17:01:59.906971"
+        },
+        "research_notes.md": {
+            "type": "markdown_research_notes",
+            "hash": "938299f310ed2948083d33c850c1f2c29ccc7698d5952378731f2f5d923f8dfe",
+            "content_char_count": 639,
+            "status": "processed",
+            "last_processed_timestamp": "2025-05-26T17:01:59.912937"
+        }
+    },
+    "version": "1.1",
+    "last_updated": "2025-05-26T17:02:04.170647"
+}

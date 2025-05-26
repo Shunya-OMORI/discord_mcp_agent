@@ -9,10 +9,10 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 BASE_WORKFLOW_LOGS_DIR = os.path.join(PROJECT_ROOT, "workflow_logs")
 BASE_PROJECT_WORKSPACE_DIR = os.path.join(PROJECT_ROOT, "project_workspace")
 
-DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "YOUR_DISCORD_BOT_TOKEN")
+DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 TEMP_ATTACHMENT_DIR = os.path.join(PROJECT_ROOT, "temp_discord_attachments")
 
-LLM_MODEL = "gemini-1.5-flash"
+LLM_MODEL = "gemini-2.0-flash"
 
 MCP_CONNECTIONS = {
     "search": {

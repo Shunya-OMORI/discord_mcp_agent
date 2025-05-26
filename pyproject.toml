@@ -4,8 +4,8 @@ version = "0.1.0"
 description = "Add your description here"
 requires-python = "~=3.12"
 dependencies = [
-#    "litellm",
-#    "google-adk",
+    #    "litellm",
+    #    "google-adk",
     "onnxruntime==1.21.0",
     "selenium",
     "beautifulsoup4",
@@ -21,7 +21,12 @@ dependencies = [
     "langchain-openai",
     "langchain-google-genai",
     "langchain-xai",
-#    "mcp-use",
+    #    "mcp-use",
     "fastembed",
-    "discord"
+    "discord",
+    "google-generativeai",
+    "pillow>=11.2.1",
+    "matplotlib",
+    "japanize-matplotlib",
+    "scipy",
 ]
